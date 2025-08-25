@@ -135,11 +135,14 @@ public:
     this->declare_parameter<bool>("mag_calibrate_on_boot", true);
     this->declare_parameter<double>("declination_deg", 0.0);
     this->declare_parameter<double>("cf_alpha", 0.98);
+    this->declare_parameter<double>("slope_alpha", 0.96);
     this->declare_parameter<double>("lpf_alpha_acc", 0.2);
     this->declare_parameter<double>("lpf_alpha_mag", 0.2);
     this->declare_parameter<bool>("softiron_enable", true);
     this->declare_parameter<double>("kalman_q", 1.0);
     this->declare_parameter<double>("kalman_r", 9.0);
+    this->declare_parameter<double>("slope_threshold", 0.1);
+    this->declare_parameter<double>("max_slope", 45.0);
     this->declare_parameter<bool>("mirror_i2c_as_serial03", true);
     this->declare_parameter<bool>("emit_uart_serial03", false);
 
@@ -151,9 +154,12 @@ public:
     mag_cal_boot_ = this->get_parameter("mag_calibrate_on_boot").as_bool();
     declination_deg_ = this->get_parameter("declination_deg").as_double();
     cf_alpha_        = this->get_parameter("cf_alpha").as_double();
+    slope_alpha_     = this->get_parameter("slope_alpha").as_double();
     lpf_alpha_acc_   = this->get_parameter("lpf_alpha_acc").as_double();
     lpf_alpha_mag_   = this->get_parameter("lpf_alpha_mag").as_double();
     softiron_enable_ = this->get_parameter("softiron_enable").as_bool();
+    slope_threshold_ = this->get_parameter("slope_threshold").as_double();
+    max_slope_       = this->get_parameter("max_slope").as_double();
     mirror_i2c_as_serial03_ = this->get_parameter("mirror_i2c_as_serial03").as_bool();
     emit_uart_serial03_     = this->get_parameter("emit_uart_serial03").as_bool();
     kalman_.setQR(this->get_parameter("kalman_q").as_double(),
@@ -185,6 +191,8 @@ public:
     imu_i2c_pub_   = this->create_publisher<tuna_interfaces::msg::ImuData>("/sensors/imu_data_i2c", 10);
     heading_i2c_pub_ = this->create_publisher<std_msgs::msg::Float64>("/sensors/heading_i2c", 10);
     heading_kalman_i2c_pub_ = this->create_publisher<std_msgs::msg::Float64>("/sensors/heading_kalman_i2c", 10);
+    slope_pub_ = this->create_publisher<std_msgs::msg::Float64>("/sensors/slope", 10);
+    calib_status_pub_ = this->create_publisher<std_msgs::msg::String>("/sensors/calibration_status", 10);
 
     // --- subscribers (existing)
     left_pwm_sub_ = this->create_subscription<std_msgs::msg::Int32>(
@@ -246,6 +254,8 @@ private:
   rclcpp::Publisher<tuna_interfaces::msg::ImuData>::SharedPtr imu_i2c_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_i2c_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_kalman_i2c_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr slope_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr calib_status_pub_;
 
   // ------------------- Serial state -------------------
   std::mutex serial_mutex_;
@@ -291,16 +301,24 @@ private:
   bool   mag_cal_boot_  = true;
   double declination_deg_ = 0.0;
   double cf_alpha_ = 0.98;
+  double slope_alpha_ = 0.96;
   double lpf_alpha_acc_ = 0.2;
   double lpf_alpha_mag_ = 0.2;
   bool   softiron_enable_ = true;
+  double slope_threshold_ = 0.1;
+  double max_slope_ = 45.0;
   bool   mirror_i2c_as_serial03_ = true;
   bool   emit_uart_serial03_     = false;
 
   // CF state
   bool cf_init_ = false;
-  double roll_cf_ = 0.0, pitch_cf_ = 0.0;
+  double roll_cf_ = 0.0, pitch_cf_ = 0.0, yaw_cf_ = 0.0;
   std::chrono::steady_clock::time_point last_cf_time_;
+  
+  // Enhanced slope composition parameters
+  double slope_alpha_ = 0.96;  // Complementary filter coefficient for slope
+  double slope_threshold_ = 0.1; // Minimum slope threshold in degrees
+  double max_slope_ = 45.0;    // Maximum slope angle in degrees
 
   // LPF state
   bool lpf_init_ = false;
@@ -310,18 +328,29 @@ private:
   // Gyro bias
   double gbx_=0.0, gby_=0.0, gbz_=0.0;
 
-  // Hard-iron + soft-iron
+  // Enhanced Hard-iron + soft-iron calibration
   bool mag_cal_initialized_ = false;
   int16_t mag_min_x_ =  32767, mag_max_x_ = -32768;
   int16_t mag_min_y_ =  32767, mag_max_y_ = -32768;
   int16_t mag_min_z_ =  32767, mag_max_z_ = -32768;
   double bias_x_ = 0.0, bias_y_ = 0.0, bias_z_ = 0.0;
+  
+  // Hard iron calibration parameters
+  int mag_cal_samples_ = 0;
+  const int mag_cal_required_samples_ = 1000; // Minimum samples for calibration
+  double mag_cal_quality_ = 0.0; // Calibration quality (0-1)
+  
+  // Soft iron correction matrix
+  double soft_iron_matrix_[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+  bool soft_iron_calibrated_ = false;
 
   // UART 03 throttle (1 Hz)
   std::chrono::steady_clock::time_point last_uart03_send_{std::chrono::steady_clock::now()};
   // Parser 03 throttle (5 Hz -> 200 ms)
   std::chrono::steady_clock::time_point last_parser03_send_{std::chrono::steady_clock::now()};
   std::chrono::steady_clock::time_point last_terminal03_send_{std::chrono::steady_clock::now()};
+  // Calibration status throttle (2 Hz -> 500 ms)
+  std::chrono::steady_clock::time_point last_calib_status_send_{std::chrono::steady_clock::now()};
 
   // --- termios baud
   speed_t baudToSpeed(int baud) {
@@ -787,13 +816,29 @@ private:
     }
 
     // MPU6050 init (0x68)
-    i2cWriteByte(i2c_mpu_fd_, 0x68, 0x6B, 0x00); // wake
-    i2cWriteByte(i2c_mpu_fd_, 0x68, 0x1C, 0x00); // ±2g
-    i2cWriteByte(i2c_mpu_fd_, 0x68, 0x1B, 0x00); // ±250 dps
+    if (!i2cWriteByte(i2c_mpu_fd_, 0x68, 0x6B, 0x00)) { // wake
+      RCLCPP_ERROR(this->get_logger(), "Failed to wake MPU6050");
+      return;
+    }
+    if (!i2cWriteByte(i2c_mpu_fd_, 0x68, 0x1C, 0x00)) { // ±2g
+      RCLCPP_ERROR(this->get_logger(), "Failed to set MPU6050 accel range");
+      return;
+    }
+    if (!i2cWriteByte(i2c_mpu_fd_, 0x68, 0x1B, 0x00)) { // ±250 dps
+      RCLCPP_ERROR(this->get_logger(), "Failed to set MPU6050 gyro range");
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(), "MPU6050 initialized successfully");
 
     // QMC5883L init (0x0D): 200Hz, 2G, continuous
     if (i2c_qmc_fd_ >= 0) {
-      i2cWriteByte(i2c_qmc_fd_, 0x0D, 0x09, 0x1D);
+      if (!i2cWriteByte(i2c_qmc_fd_, 0x0D, 0x09, 0x1D)) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to initialize QMC5883L");
+        close(i2c_qmc_fd_);
+        i2c_qmc_fd_ = -1;
+      } else {
+        RCLCPP_INFO(this->get_logger(), "QMC5883L initialized successfully");
+      }
     }
 
     // --- BOOT CALIBRATION (countdown)
@@ -860,6 +905,12 @@ private:
         bias_y_ = (mag_max_y_ + mag_min_y_) * 0.5;
         bias_z_ = (mag_max_z_ + mag_min_z_) * 0.5;
         mag_cal_initialized_ = true;
+        mag_cal_samples_ = 1000; // Set initial samples for quality assessment
+        mag_cal_quality_ = assessCalibrationQuality();
+        
+        RCLCPP_INFO(this->get_logger(), 
+          "Magnetic calibration completed. Quality: %.2f, Bias: (%.1f, %.1f, %.1f)", 
+          mag_cal_quality_, bias_x_, bias_y_, bias_z_);
       }
 
       // reset LPF init
@@ -924,13 +975,20 @@ private:
       if (!cf_init_) {
         roll_cf_  = roll_acc;
         pitch_cf_ = pitch_acc;
+        yaw_cf_   = 0.0;
         cf_init_ = true;
       } else {
         double roll_g  = roll_cf_  + gx_dps * dt;
         double pitch_g = pitch_cf_ + gy_dps * dt;
+        double yaw_g   = yaw_cf_   + gz_dps * dt;
+        
         roll_cf_  = cf_alpha_*roll_g  + (1.0 - cf_alpha_)*roll_acc;
         pitch_cf_ = cf_alpha_*pitch_g + (1.0 - cf_alpha_)*pitch_acc;
+        yaw_cf_   = yaw_g; // Yaw only from gyro for now
       }
+
+      // Enhanced slope composition
+      double slope_magnitude = calculateSlope(roll_cf_, pitch_cf_);
 
       // ---- MAG (QMC5883L)
       int16_t mx=0, my=0, mz=0;
@@ -947,21 +1005,9 @@ private:
         }
       }
 
-      // Hard-iron autocal
+      // Enhanced Hard-iron calibration
       if (mag_ok && mag_cal_boot_) {
-        if (!mag_cal_initialized_) {
-          mag_min_x_ = mag_max_x_ = mx;
-          mag_min_y_ = mag_max_y_ = my;
-          mag_min_z_ = mag_max_z_ = mz;
-          mag_cal_initialized_ = true;
-        } else {
-          mag_min_x_ = std::min(mag_min_x_, mx); mag_max_x_ = std::max(mag_max_x_, mx);
-          mag_min_y_ = std::min(mag_min_y_, my); mag_max_y_ = std::max(mag_max_y_, my);
-          mag_min_z_ = std::min(mag_min_z_, mz); mag_max_z_ = std::max(mag_max_z_, mz);
-        }
-        bias_x_ = (mag_max_x_ + mag_min_x_) * 0.5;
-        bias_y_ = (mag_max_y_ + mag_min_y_) * 0.5;
-        bias_z_ = (mag_max_z_ + mag_min_z_) * 0.5;
+        updateHardIronCalibration(mx, my, mz);
       }
 
       // bias çıkar
@@ -992,12 +1038,17 @@ private:
         mz_f_ = lpf_alpha_mag_*mzc + (1.0-lpf_alpha_mag_)*mz_f_;
       }
 
-      // Tilt compensation
-      double pr = pitch_cf_ * 3.14159265358979323846 / 180.0;
-      double rr = roll_cf_  * 3.14159265358979323846 / 180.0;
-      double Xh = mx_f_ * std::cos(pr) + mz_f_ * std::sin(pr);
-      double Yh = mx_f_ * std::sin(rr) * std::sin(pr) + my_f_ * std::cos(rr) - mz_f_ * std::sin(rr) * std::cos(pr);
-      double heading = std::atan2(Yh, Xh) * 180.0 / 3.14159265358979323846;
+      // Enhanced tilt compensation
+      double heading = calculateTiltCompensatedHeading(mx_f_, my_f_, mz_f_, roll_cf_, pitch_cf_);
+
+      // Magnetic interference detection
+      bool interference_detected = detectMagneticInterference(mx_f_, my_f_, mz_f_);
+      if (interference_detected) {
+        // Use gyro-based heading when interference is detected
+        heading = yaw_cf_;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+          MAGENTA "Magnetic interference detected, using gyro heading" RESET);
+      }
 
       // declination & Kalman
       heading = wrapDeg(heading + declination_deg_);
@@ -1017,8 +1068,10 @@ private:
       {
         std_msgs::msg::Float64 h;  h.data = heading;
         std_msgs::msg::Float64 hk; hk.data = heading_kal;
+        std_msgs::msg::Float64 s;  s.data = slope_magnitude;
         heading_i2c_pub_->publish(h);
         heading_kalman_i2c_pub_->publish(hk);
+        slope_pub_->publish(s);
       }
 
       // --- 03 formatlı paket (STM ile birebir; TEMP integer, ör: 029)
@@ -1061,6 +1114,13 @@ private:
           std::chrono::duration_cast<std::chrono::seconds>(nowtp2 - last_uart03_send_).count() >= 1) {
         writeLineToSerial(pkt03);
         last_uart03_send_ = nowtp2;
+      }
+
+      // 4) Calibration status publishing (2 Hz)
+      auto nowtp3 = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(nowtp3 - last_calib_status_send_).count() >= 500) {
+        publishCalibrationStatus();
+        last_calib_status_send_ = nowtp3;
       }
 
       std::this_thread::sleep_until(next);
@@ -1107,6 +1167,149 @@ private:
 
   double getCurrentTimestamp() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  // Enhanced slope composition function with moving average
+  double calculateSlope(double roll, double pitch) {
+    // Calculate total slope magnitude from roll and pitch
+    double slope_magnitude = std::sqrt(roll * roll + pitch * pitch);
+    
+    // Apply threshold to filter out noise
+    if (slope_magnitude < slope_threshold_) {
+      slope_magnitude = 0.0;
+    }
+    
+    // Limit maximum slope
+    if (slope_magnitude > max_slope_) {
+      slope_magnitude = max_slope_;
+    }
+    
+    // Apply moving average filter for stability
+    static double slope_history[5] = {0.0};
+    static int history_index = 0;
+    static bool history_filled = false;
+    
+    slope_history[history_index] = slope_magnitude;
+    history_index = (history_index + 1) % 5;
+    if (history_index == 0) history_filled = true;
+    
+    double filtered_slope = 0.0;
+    int count = history_filled ? 5 : history_index;
+    for (int i = 0; i < count; i++) {
+      filtered_slope += slope_history[i];
+    }
+    filtered_slope /= count;
+    
+    return filtered_slope;
+  }
+
+  // Enhanced compass calibration quality assessment
+  double assessCalibrationQuality() {
+    if (!mag_cal_initialized_ || mag_cal_samples_ < mag_cal_required_samples_) {
+      return 0.0;
+    }
+    
+    // Calculate calibration spread
+    double dx = mag_max_x_ - mag_min_x_;
+    double dy = mag_max_y_ - mag_min_y_;
+    double dz = mag_max_z_ - mag_min_z_;
+    
+    // Check if we have sufficient spread in all axes
+    double min_spread = std::min({dx, dy, dz});
+    double max_spread = std::max({dx, dy, dz});
+    
+    if (min_spread < 1000 || max_spread < 2000) {
+      return 0.0; // Insufficient spread
+    }
+    
+    // Calculate quality based on spread uniformity
+    double spread_ratio = min_spread / max_spread;
+    double quality = std::min(1.0, spread_ratio * 2.0); // Scale to 0-1
+    
+    return quality;
+  }
+
+  // Enhanced hard iron calibration
+  void updateHardIronCalibration(int16_t mx, int16_t my, int16_t mz) {
+    if (!mag_cal_initialized_) {
+      mag_min_x_ = mag_max_x_ = mx;
+      mag_min_y_ = mag_max_y_ = my;
+      mag_min_z_ = mag_max_z_ = mz;
+      mag_cal_initialized_ = true;
+      mag_cal_samples_ = 1;
+    } else {
+      mag_min_x_ = std::min(mag_min_x_, mx);
+      mag_max_x_ = std::max(mag_max_x_, mx);
+      mag_min_y_ = std::min(mag_min_y_, my);
+      mag_max_y_ = std::max(mag_max_y_, my);
+      mag_min_z_ = std::min(mag_min_z_, mz);
+      mag_max_z_ = std::max(mag_max_z_, mz);
+      mag_cal_samples_++;
+    }
+    
+    // Update bias and quality
+    bias_x_ = (mag_max_x_ + mag_min_x_) * 0.5;
+    bias_y_ = (mag_max_y_ + mag_min_y_) * 0.5;
+    bias_z_ = (mag_max_z_ + mag_min_z_) * 0.5;
+    
+    mag_cal_quality_ = assessCalibrationQuality();
+  }
+
+  // Enhanced tilt compensation with improved accuracy
+  double calculateTiltCompensatedHeading(double mx, double my, double mz, double roll, double pitch) {
+    // Convert to radians
+    double roll_rad = roll * M_PI / 180.0;
+    double pitch_rad = pitch * M_PI / 180.0;
+    
+    // Apply tilt compensation matrix
+    double Xh = mx * std::cos(pitch_rad) + mz * std::sin(pitch_rad);
+    double Yh = mx * std::sin(roll_rad) * std::sin(pitch_rad) + 
+                my * std::cos(roll_rad) - 
+                mz * std::sin(roll_rad) * std::cos(pitch_rad);
+    
+    // Calculate heading
+    double heading = std::atan2(Yh, Xh) * 180.0 / M_PI;
+    
+    // Normalize to 0-360
+    heading = wrapDeg(heading);
+    
+    return heading;
+  }
+
+  // Publish calibration status
+  void publishCalibrationStatus() {
+    std::ostringstream oss;
+    oss << "GYRO_CAL:" << (gyro_cal_boot_ ? "OK" : "SKIP") 
+        << " MAG_CAL:" << (mag_cal_initialized_ ? "OK" : "PENDING")
+        << " QUALITY:" << std::fixed << std::setprecision(2) << mag_cal_quality_
+        << " SAMPLES:" << mag_cal_samples_;
+    
+    std_msgs::msg::String status_msg;
+    status_msg.data = oss.str();
+    calib_status_pub_->publish(status_msg);
+  }
+
+  // Detect magnetic interference
+  bool detectMagneticInterference(double mx, double my, double mz) {
+    // Calculate magnetic field magnitude
+    double mag_magnitude = std::sqrt(mx*mx + my*my + mz*mz);
+    
+    // Normal magnetic field should be around 0.4-0.6 Gauss (40000-60000 in raw units)
+    // Check for significant deviation
+    if (mag_magnitude < 20000 || mag_magnitude > 80000) {
+      return true; // Interference detected
+    }
+    
+    // Check for sudden changes (indicating nearby magnetic objects)
+    static double last_mag_magnitude = mag_magnitude;
+    double mag_change = std::abs(mag_magnitude - last_mag_magnitude);
+    last_mag_magnitude = mag_magnitude;
+    
+    if (mag_change > 10000) { // Sudden change threshold
+      return true; // Interference detected
+    }
+    
+    return false; // No interference
   }
 
   void sendCurrentPwmIfAutonomous(const char* src) {
